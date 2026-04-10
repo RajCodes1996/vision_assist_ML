@@ -833,7 +833,8 @@
                 <li>Say "scan" to open camera and capture</li>
                 <li>Say "read latest" to hear extracted text</li>
                 <li>Say "history" to access previous scans</li>
-                <li>Press Alt+V for voice commands</li>
+                <li>Say "activate voice" to turn on voice commands</li>
+                <li>Press Alt+V to activate voice commands manually if needed</li>
                 <li>Press Alt+R to read aloud</li>
               </ul>
             </div>
@@ -1234,6 +1235,7 @@
         const utterance = new SpeechSynthesisUtterance('No text yet. Please scan an image first.');
         utterance.rate = 0.95;
         speechSynthesis.cancel();
+        scheduleVoiceRestart(400);
         speechSynthesis.speak(utterance);
         return;
       }
@@ -1251,6 +1253,7 @@
       if (speechSynthesis.speaking) {
         // Toggle — stop reading
         speechSynthesis.cancel();
+        scheduleVoiceRestart(400);
         if (speakButton) {
           speakButton.classList.remove("speaking");
           speakButton.textContent = "Read Aloud";
@@ -1263,6 +1266,7 @@
       utterance.rate = 0.95;
       utterance.pitch = 1.0;
       utterance.volume = 1.0;
+      clearVoiceRestartTimer();
 
       utterance.onstart = function onStart() {
         console.log('Speech synthesis started');
@@ -1274,6 +1278,7 @@
 
       utterance.onend = function onFinish() {
         console.log('Speech synthesis ended');
+        scheduleVoiceRestart();
         if (speakButton) {
           speakButton.classList.remove("speaking");
           speakButton.textContent = "Read Aloud";
@@ -1282,6 +1287,7 @@
 
       utterance.onerror = function onError(event) {
         console.error('Speech synthesis error:', event.error);
+        scheduleVoiceRestart();
         if (speakButton) {
           speakButton.classList.remove("speaking");
           speakButton.textContent = "Read Aloud";
@@ -1331,6 +1337,55 @@
     let voiceCommandEnabled = false;
     let hasRecognizedSpeech = false;
     let voiceRetryCount = 0;
+    let voiceHandsFreeMode = false;
+    let voiceRestartTimer = null;
+    let awaitingVoiceGesture = false;
+    let wakeWordMode = true;
+
+    function clearVoiceRestartTimer() {
+      if (voiceRestartTimer) {
+        clearTimeout(voiceRestartTimer);
+        voiceRestartTimer = null;
+      }
+    }
+
+    function scheduleVoiceRestart(delay = 900) {
+      if (!voiceHandsFreeMode || isListening || speechSynthesis.speaking) {
+        return;
+      }
+
+      clearVoiceRestartTimer();
+      voiceRestartTimer = setTimeout(function restartVoiceAfterDelay() {
+        voiceRestartTimer = null;
+        if (!voiceHandsFreeMode || isListening) {
+          return;
+        }
+        if (speechSynthesis.speaking) {
+          scheduleVoiceRestart(500);
+          return;
+        }
+        startVoiceCommands({ silent: true, isAutoStart: true });
+      }, delay);
+    }
+
+    function scheduleWakeWordRestart(delay = 1200) {
+      if (voiceHandsFreeMode || !wakeWordMode || isListening || speechSynthesis.speaking) {
+        return;
+      }
+
+      clearVoiceRestartTimer();
+      voiceRestartTimer = setTimeout(function restartWakeWordAfterDelay() {
+        voiceRestartTimer = null;
+        if (voiceHandsFreeMode || !wakeWordMode || isListening) {
+          return;
+        }
+        if (speechSynthesis.speaking) {
+          scheduleWakeWordRestart(600);
+          return;
+        }
+        startWakeWordListener({ silent: true, isAutoStart: true });
+      }, delay);
+    }
 
     function initVoiceCommands() {
       if (voiceCommandEnabled) {
@@ -1348,15 +1403,19 @@
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         recognition = new SpeechRecognition();
         recognition.continuous = true;
-        recognition.interimResults = true;
+        recognition.interimResults = false;
         recognition.lang = 'en-US';
-        recognition.maxAlternatives = 3;
+        recognition.maxAlternatives = 5;
 
         recognition.onstart = function() {
           isListening = true;
           hasRecognizedSpeech = false;
+          awaitingVoiceGesture = false;
+          clearVoiceRestartTimer();
           console.log('Voice recognition started');
-          showToast('Listening for voice commands...');
+          if (voiceHandsFreeMode) {
+            showToast('Listening for voice commands...');
+          }
           updateVoiceButtonState(true);
         };
 
@@ -1374,11 +1433,30 @@
             voiceRetryCount = 0;
             const transcript = finalTranscript.trim();
             console.log('Voice result:', transcript);
-            showToast(`Heard: "${transcript}"`);
-            if (speechSynthesis.speaking) {
-              speechSynthesis.cancel();
+            const normalizedTranscript = transcript.toLowerCase().trim();
+
+            if (!voiceHandsFreeMode) {
+              const wantsActivateVoice =
+                normalizedTranscript.includes('activate voice') ||
+                normalizedTranscript.includes('start voice') ||
+                normalizedTranscript.includes('turn on voice') ||
+                normalizedTranscript.includes('enable voice');
+
+              if (wantsActivateVoice) {
+                wakeWordMode = false;
+                voiceHandsFreeMode = true;
+                showToast('Voice commands activated.');
+                announce('Voice commands activated. I am listening.', true);
+              } else {
+                showToast('Wake phrase not detected.');
+              }
+            } else {
+              showToast(`Heard: "${transcript}"`);
+              if (speechSynthesis.speaking) {
+                speechSynthesis.cancel();
+              }
+              processVoiceCommand(normalizedTranscript);
             }
-            processVoiceCommand(transcript.toLowerCase().trim());
             if (recognition && isListening) {
               recognition.stop();
             }
@@ -1389,6 +1467,11 @@
           isListening = false;
           console.log('Voice recognition ended');
           updateVoiceButtonState(false);
+          if (voiceHandsFreeMode && !speechSynthesis.speaking) {
+            scheduleVoiceRestart(700);
+          } else if (wakeWordMode && !speechSynthesis.speaking) {
+            scheduleWakeWordRestart(1200);
+          }
         };
 
         recognition.onspeechstart = function() {
@@ -1404,7 +1487,9 @@
 
           if (event.error === 'no-speech' && voiceRetryCount < 1) {
             voiceRetryCount += 1;
-            showToast('No speech detected. Trying once more...');
+            if (voiceHandsFreeMode) {
+              showToast('No speech detected. Trying once more...');
+            }
             setTimeout(function retryVoiceRecognition() {
               if (recognition && !isListening) {
                 try {
@@ -1417,10 +1502,15 @@
             return;
           }
 
+          if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+            awaitingVoiceGesture = true;
+            showToast('Microphone access needs one tap or key press.');
+          }
+
           let errorMsg = 'Voice recognition error. ';
           switch(event.error) {
             case 'no-speech':
-              errorMsg += 'No speech detected. Press Voice and speak immediately in Chrome or Edge.';
+              errorMsg += 'No speech detected. Speak immediately in Chrome or Edge.';
               break;
             case 'audio-capture':
               errorMsg += 'No microphone found. Please check and try again.';
@@ -1434,7 +1524,9 @@
             default:
               errorMsg += 'Please try again.';
           }
-          announce(errorMsg, false);
+          if (voiceHandsFreeMode) {
+            announce(errorMsg, false);
+          }
         };
 
         voiceCommandEnabled = true;
@@ -1487,6 +1579,116 @@
       }
     }
 
+    function startVoiceCommands(options = {}) {
+      const { silent = false, isAutoStart = false } = options;
+      if (!recognition) {
+        initVoiceCommands();
+      }
+      if (recognition && !isListening) {
+        try {
+          voiceHandsFreeMode = true;
+          wakeWordMode = false;
+          clearVoiceRestartTimer();
+          voiceRetryCount = 0;
+          recognition.start();
+        } catch (error) {
+          console.error('Error starting voice recognition:', error);
+          if (isAutoStart && error.name === 'NotAllowedError') {
+            awaitingVoiceGesture = true;
+            showToast('Voice will start after the first tap or key press.');
+            return;
+          }
+          if (!silent) {
+            announce('Could not start voice recognition.', false);
+          }
+        }
+      } else if (isListening && !silent) {
+        announce('Already listening.', false);
+      }
+    }
+
+    function startWakeWordListener(options = {}) {
+      const { silent = false, isAutoStart = false } = options;
+      if (!recognition) {
+        initVoiceCommands();
+      }
+      if (recognition && !isListening) {
+        try {
+          voiceHandsFreeMode = false;
+          wakeWordMode = true;
+          clearVoiceRestartTimer();
+          voiceRetryCount = 0;
+          recognition.start();
+        } catch (error) {
+          console.error('Error starting wake word listener:', error);
+          if (isAutoStart && error.name === 'NotAllowedError') {
+            awaitingVoiceGesture = true;
+            showToast('Wake phrase listening will begin after the first tap or key press.');
+            return;
+          }
+          if (!silent) {
+            announce('Could not start wake phrase listening.', false);
+          }
+        }
+      }
+    }
+
+    function stopVoiceCommands() {
+      voiceHandsFreeMode = false;
+      wakeWordMode = true;
+      awaitingVoiceGesture = false;
+      clearVoiceRestartTimer();
+      if (recognition && isListening) {
+        try {
+          recognition.stop();
+        } catch (error) {
+          console.error('Error stopping voice recognition:', error);
+        }
+      }
+      updateVoiceButtonState(false);
+    }
+
+    function toggleVoiceCommands() {
+      if (isListening || voiceHandsFreeMode) {
+        stopVoiceCommands();
+        showToast('Voice commands paused. Say "activate voice" or press Alt+V to start again.');
+      } else {
+        startVoiceCommands();
+      }
+    }
+
+    function armVoiceStartOnFirstInteraction() {
+      const bootstrapVoiceStart = function() {
+        if (!awaitingVoiceGesture) {
+          return;
+        }
+        awaitingVoiceGesture = false;
+        startWakeWordListener({ silent: true, isAutoStart: true });
+      };
+
+      document.addEventListener('pointerdown', bootstrapVoiceStart, { passive: true });
+      document.addEventListener('keydown', bootstrapVoiceStart);
+    }
+
+    function updateVoiceButtonState(listening) {
+      const voiceBtn = document.getElementById('voiceCommandBtn');
+      if (!voiceBtn) {
+        return;
+      }
+
+      if (listening) {
+        voiceBtn.classList.add('speaking');
+        voiceBtn.setAttribute('aria-label', voiceHandsFreeMode ? 'Pause voice commands' : 'Listening for activate voice');
+        voiceBtn.title = voiceHandsFreeMode ? 'Pause voice commands' : 'Listening for "activate voice"';
+        voiceBtn.innerHTML = '<span aria-hidden="true">🎤</span> Listening';
+      } else {
+        voiceBtn.classList.remove('speaking');
+        voiceBtn.setAttribute('aria-label', voiceHandsFreeMode ? 'Start voice commands' : 'Activate voice commands');
+        voiceBtn.title = voiceHandsFreeMode ? 'Start voice commands (Alt+V)' : 'Activate voice commands (Alt+V)';
+        voiceBtn.innerHTML = `<span aria-hidden="true">🎤</span> ${voiceHandsFreeMode ? 'Voice' : 'Voice Off'}`;
+      }
+    }
+
     function processVoiceCommand(command) {
       console.log('Processing voice command:', command);
 
@@ -1497,40 +1699,67 @@
         .replace(/\s+/g, ' ')
         .trim();
 
-      const wantsHelp = normalized.includes('help') || normalized.includes('command');
+      const commandText = ` ${normalized} `
+        .replace(/\bplease\b/g, ' ')
+        .replace(/\bthe\b/g, ' ')
+        .replace(/\bnow\b/g, ' ')
+        .replace(/\bscan it\b/g, ' scan ')
+        .replace(/\bopen the camera\b/g, ' camera ')
+        .replace(/\bshow me history\b/g, ' history ')
+        .replace(/\bread the latest text\b/g, ' read latest ')
+        .replace(/\bread latest text\b/g, ' read latest ')
+        .replace(/\bred latest\b/g, ' read latest ')
+        .replace(/\bde activate voice\b/g, ' deactivate voice ')
+        .replace(/\bturn voice off\b/g, ' turn off voice ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      const wantsHelp = commandText.includes('help') || commandText.includes('command');
+      const wantsDeactivateVoice =
+        commandText.includes('deactivate voice') ||
+        commandText.includes('disable voice') ||
+        commandText.includes('turn off voice') ||
+        commandText.includes('stop voice') ||
+        commandText.includes('voice off');
       const wantsHistory =
-        normalized.includes('history') ||
-        normalized.includes('recent scan') ||
-        normalized.includes('recent read') ||
-        normalized.includes('previous scan');
-      const wantsCamera = normalized.includes('camera');
+        commandText.includes('history') ||
+        commandText.includes('recent scan') ||
+        commandText.includes('recent read') ||
+        commandText.includes('previous scan');
+      const wantsCamera = commandText.includes('camera');
       const wantsScan =
         !wantsHistory &&
         !wantsCamera &&
         (
-          normalized.includes('scan') ||
-          normalized.includes('take photo') ||
-          normalized.includes('take picture') ||
-          normalized.includes('capture')
+          commandText.includes('scan') ||
+          commandText.includes('take photo') ||
+          commandText.includes('take picture') ||
+          commandText.includes('capture')
         );
       const wantsReadLatest =
         !wantsHistory &&
         (
-          normalized === 'read' ||
-          normalized === 'speak' ||
+          commandText === 'read' ||
+          commandText === 'speak' ||
           (
-            (normalized.includes('read') || normalized.includes('speak')) &&
+            (commandText.includes('read') || commandText.includes('speak')) &&
             (
-              normalized.includes('latest') ||
-              normalized.includes('last') ||
-              normalized.includes('text') ||
-              normalized.includes('aloud')
+              commandText.includes('latest') ||
+              commandText.includes('last') ||
+              commandText.includes('text') ||
+              commandText.includes('aloud')
             )
           )
         );
 
+      if (wantsDeactivateVoice) {
+        stopVoiceCommands();
+        announce('Voice commands deactivated. Say activate voice whenever you want me again.', true);
+        return;
+      }
+
       if (wantsHelp) {
-        const helpMsg = 'Available voice commands: scan, camera, history, read latest, or help. You can also use keyboard shortcuts: Alt+S for scan, Alt+V for voice, Alt+R to read, Alt+H for history.';
+        const helpMsg = 'Available voice commands: scan, camera, history, read latest, deactivate voice, or help. You can also use keyboard shortcuts: Alt+S for scan, Alt+V for voice, Alt+R to read, Alt+H for history.';
         announce(helpMsg, true);
         return;
       }
@@ -1567,17 +1796,17 @@
       }
 
       // Scan command
-      if (normalized.match(/^(scan|take photo|take picture|capture|capture image)$/)) {
+      if (normalized.match(/^(scan|scan now|take photo|take picture|capture|capture image|start scan)$/)) {
         announce('Opening camera for scanning.', true);
         openCamera();
       }
       // Camera command
-      else if (normalized.match(/^(camera|open camera)$/)) {
+      else if (normalized.match(/^(camera|open camera|start camera)$/)) {
         announce('Opening camera.', true);
         openCamera();
       }
       // History command
-      else if (normalized.match(/^(history|recent|previous|recent scans|show history)$/)) {
+      else if (normalized.match(/^(history|recent|previous|recent scans|show history|open history)$/)) {
         announce('Loading recent scans.', true);
         loadHistory();
         // Scroll to history section
@@ -1587,7 +1816,7 @@
         }
       }
       // Read latest command
-      else if (normalized.match(/^(read latest|read last|read|speak|read text|read aloud)$/)) {
+      else if (normalized.match(/^(read latest|read last|read|speak|read text|read aloud|read latest text|read the latest text)$/)) {
         if (currentText && currentText.trim()) {
           // Do NOT call announce() before readAloud() — announce would cancel readAloud's speech
           readAloud();
@@ -1595,9 +1824,14 @@
           announce('No text to read. Please scan an image first.', false);
         }
       }
+      // Deactivate voice command
+      else if (normalized.match(/^(deactivate voice|disable voice|turn off voice|stop voice|voice off)$/)) {
+        stopVoiceCommands();
+        announce('Voice commands deactivated. Say activate voice whenever you want me again.', true);
+      }
       // Help command
       else if (normalized.match(/^(help|commands|what can i say|what commands)$/)) {
-        const helpMsg = 'Available voice commands: scan, camera, history, read latest, or help. You can also use keyboard shortcuts: Alt+S for scan, Alt+V for voice, Alt+R to read, Alt+H for history.';
+        const helpMsg = 'Available voice commands: scan, camera, history, read latest, deactivate voice, or help. You can also use keyboard shortcuts: Alt+S for scan, Alt+V for voice, Alt+R to read, Alt+H for history.';
         announce(helpMsg, true);
       }
       // Not recognized
@@ -1609,6 +1843,8 @@
     }
 
     function announce(message, shouldInterrupt = true) {
+      clearVoiceRestartTimer();
+
       // Cancel current speech if requested
       if (shouldInterrupt && speechSynthesis.speaking) {
         speechSynthesis.cancel();
@@ -1625,14 +1861,20 @@
       utterance.pitch = 1.0;
       utterance.volume = 1.0;
 
+      utterance.onend = function() {
+        scheduleVoiceRestart();
+      };
+
       utterance.onerror = function(event) {
         console.error('Announce speech synthesis error:', event.error);
+        scheduleVoiceRestart();
       };
 
       try {
         speechSynthesis.speak(utterance);
       } catch (err) {
         console.error('announce() speechSynthesis.speak failed:', err);
+        scheduleVoiceRestart();
       }
     }
 
@@ -1737,6 +1979,7 @@
     // Initialize voice commands on page load
     document.addEventListener('DOMContentLoaded', function() {
       console.log('Initializing page...');
+      armVoiceStartOnFirstInteraction();
       
       // Initialize voice commands
       try {
@@ -1752,15 +1995,18 @@
         voiceBtn.className = 'btn soft-button';
         voiceBtn.type = 'button';
         voiceBtn.id = 'voiceCommandBtn';
-        voiceBtn.onclick = startVoiceCommands;
-        voiceBtn.setAttribute('aria-label', 'Start voice commands');
-        voiceBtn.title = 'Start voice commands (Alt+V)';
+        voiceBtn.onclick = toggleVoiceCommands;
+        voiceBtn.setAttribute('aria-label', 'Activate voice commands');
+        voiceBtn.title = 'Activate voice commands (Alt+V)';
         voiceBtn.innerHTML = '<span aria-hidden="true">🎤</span> Voice';
         headerActions.appendChild(voiceBtn);
+        updateVoiceButtonState(false);
         console.log('Voice button added to header');
       } else {
         console.warn('Could not find header actions element to add voice button');
       }
+
+      startWakeWordListener({ silent: true, isAutoStart: true });
 
       // Load initial history
       try {
