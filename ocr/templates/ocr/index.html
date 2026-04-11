@@ -978,123 +978,172 @@
   </main>
 
   <script>
+    /* ═══════════════════════════════════════════════════
+       FEATURE 2 — STATE MACHINE
+       Four clean states drive the entire voice engine.
+         IDLE        → waiting for wake word
+         LISTENING   → wake word heard, capturing command
+         PROCESSING  → executing the command
+         SPEAKING    → TTS output in progress
+    ═══════════════════════════════════════════════════ */
+    const STATE = Object.freeze({
+      IDLE:       'IDLE',
+      LISTENING:  'LISTENING',
+      PROCESSING: 'PROCESSING',
+      SPEAKING:   'SPEAKING',
+    });
+
+    /* ═══════════════════════════════════════════════════
+       FEATURE 1 — WAKE WORDS
+       "vision" and "assist" (+ friendlier aliases)
+    ═══════════════════════════════════════════════════ */
+    const WAKE_WORDS = [
+      'vision', 'assist',
+      'activate voice', 'start voice', 'turn on voice',
+      'enable voice', 'hey vision', 'wake up',
+    ];
+
+    /* ═══════════════════════════════════════════════════
+       FEATURE 5 — CONFIDENCE THRESHOLD
+       Ignore recognitions below 65 % confidence.
+    ═══════════════════════════════════════════════════ */
+    const CONFIDENCE_THRESHOLD = 0.65;
+
+    /* ═══════════════════════════════════════════════════
+       FEATURE 4 — DEBOUNCE
+       Same command won't repeat within 2 seconds.
+    ═══════════════════════════════════════════════════ */
+    const DEBOUNCE_MS   = 2000;
+    let lastCommand     = null;
+    let lastCommandTime = 0;
+
+    /* ═══════════════════════════════════════════════════
+       FEATURE 8 — NLP INTENT MAP
+       Synonym arrays → intent name. No more fragile regex.
+    ═══════════════════════════════════════════════════ */
+    const INTENT_MAP = {
+      scan:         ['scan', 'take photo', 'take picture', 'take a photo', 'capture',
+                     'capture image', 'start scan', 'do a scan', 'photograph', 'shoot'],
+      camera:       ['camera', 'open camera', 'start camera', 'use camera', 'launch camera'],
+      read:         ['read', 'speak', 'say', 'play', 'read aloud', 'read out loud',
+                     'read latest', 'read last', 'read current', 'read result', 'read text',
+                     'speak text', 'tell me'],
+      history:      ['history', 'recent scans', 'previous scans', 'saved scans',
+                     'open history', 'show history', 'read history', 'load history', 'past scans'],
+      stop_reading: ['stop reading', 'stop speech', 'stop speaking', 'pause reading',
+                     'quiet', 'silence', 'mute'],
+      deactivate:   ['deactivate', 'disable voice', 'stop voice', 'turn off voice',
+                     'pause voice', 'voice off', 'stop listening', 'deactivate voice'],
+      help:         ['help', 'commands', 'what can i say', 'what commands', 'what can you do'],
+      extract:      ['extract', 'run ocr', 'run extraction', 'process image', 'process photo',
+                     'analyse', 'analyze', 'ocr'],
+    };
+
+    /** Normalise text and find the first matching intent. Returns null if none. */
+    function matchIntent(text) {
+      const norm = text.toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      for (const [intent, phrases] of Object.entries(INTENT_MAP)) {
+        for (const phrase of phrases) {
+          if (norm.includes(phrase)) return intent;
+        }
+      }
+      return null;
+    }
+
     /* ─────────────────────────────────────────────
-       STATE
+       APP STATE
     ───────────────────────────────────────────── */
     let currentFile  = null;
-    let currentText  = "";
-    const THEME_KEY  = "vision-assist-theme";
+    let currentText  = '';
+    const THEME_KEY  = 'vision-assist-theme';
     let mediaStream  = null;
 
-    // Voice recognition state
-    let recognition        = null;
-    let isListening        = false;   // mic is currently open
-    let voiceActive        = false;   // hands-free mode on
-    let wakeWordActive     = true;    // waiting for "activate voice"
-    let restartTimer       = null;
-    let permissionNeeded   = false;   // browser needs a tap before mic
+    // Voice recognition
+    let recognition      = null;
+    let currentState     = STATE.IDLE;
+    let isListening      = false;
+    let permissionNeeded = false;
+    let voiceEnabled     = true;    // global on/off switch
+    let restartTimer     = null;
+    let silenceTimer     = null;    // Feature 3 abort guard
 
     initializeTheme();
 
+    /* ─────────────────────────────────────────────
+       THEME
+    ───────────────────────────────────────────── */
     function initializeTheme() {
-      const savedTheme = localStorage.getItem(THEME_KEY);
-      const preferredDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-      const theme = savedTheme || (preferredDark ? "dark" : "light");
-      applyTheme(theme);
+      const savedTheme    = localStorage.getItem(THEME_KEY);
+      const preferredDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      applyTheme(savedTheme || (preferredDark ? 'dark' : 'light'));
     }
 
     function toggleTheme() {
-      const nextTheme = document.body.dataset.theme === "dark" ? "light" : "dark";
-      applyTheme(nextTheme);
-      localStorage.setItem(THEME_KEY, nextTheme);
+      const next = document.body.dataset.theme === 'dark' ? 'light' : 'dark';
+      applyTheme(next);
+      localStorage.setItem(THEME_KEY, next);
     }
 
     function applyTheme(theme) {
       document.body.dataset.theme = theme;
-      const label = document.getElementById("themeToggleLabel");
-      if (label) {
-        label.textContent = theme === "dark" ? "Light Mode" : "Dark Mode";
-      }
+      const label = document.getElementById('themeToggleLabel');
+      if (label) label.textContent = theme === 'dark' ? 'Light Mode' : 'Dark Mode';
     }
 
+    /* ─────────────────────────────────────────────
+       GALLERY / CAMERA / FILE HANDLING
+    ───────────────────────────────────────────── */
     function openGallery() {
-      const input = document.getElementById("fileInput");
-      input.removeAttribute("capture");
+      const input = document.getElementById('fileInput');
+      input.removeAttribute('capture');
       input.click();
     }
 
     function openCamera() {
-      const input = document.getElementById("fileInput");
-      input.removeAttribute("capture");
-      // Check if we can use actual camera API
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
         captureWithCamera();
       } else {
-        // Fallback to file input with camera capture
-        input.setAttribute("capture", "environment");
+        const input = document.getElementById('fileInput');
+        input.setAttribute('capture', 'environment');
         input.click();
       }
     }
 
-    function handleZoneClick() {
-      if (!currentFile) {
-        openGallery();
-      }
-    }
-
-    function handleZoneKeydown(event) {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        handleZoneClick();
-      }
-    }
-
-    function handleDragOver(event) {
-      event.preventDefault();
-      document.getElementById("captureZone").classList.add("drag-over");
-    }
-
-    function handleDrop(event) {
-      event.preventDefault();
-      document.getElementById("captureZone").classList.remove("drag-over");
-      if (event.dataTransfer.files[0]) {
-        setFile(event.dataTransfer.files[0]);
-      }
-    }
-
-    function handleFile(event) {
-      if (event.target.files[0]) {
-        setFile(event.target.files[0]);
-      }
-    }
+    function handleZoneClick()          { if (!currentFile) openGallery(); }
+    function handleZoneKeydown(event)   { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); handleZoneClick(); } }
+    function handleDragOver(event)      { event.preventDefault(); document.getElementById('captureZone').classList.add('drag-over'); }
+    function handleDrop(event)          { event.preventDefault(); document.getElementById('captureZone').classList.remove('drag-over'); if (event.dataTransfer.files[0]) setFile(event.dataTransfer.files[0]); }
+    function handleFile(event)          { if (event.target.files[0]) setFile(event.target.files[0]); }
 
     function setFile(file) {
       currentFile = file;
       const reader = new FileReader();
-      reader.onload = function onLoad(loadEvent) {
-        const zone = document.getElementById("captureZone");
-        zone.className = "capture-zone has-image";
-        zone.onclick = null;
-        zone.onkeydown = null;
-        zone.innerHTML = `
-          <img src="${loadEvent.target.result}" alt="Preview of the selected image for OCR">
+      reader.onload = function(e) {
+        const zone = document.getElementById('captureZone');
+        zone.className  = 'capture-zone has-image';
+        zone.onclick    = null;
+        zone.onkeydown  = null;
+        zone.innerHTML  = `
+          <img src="${e.target.result}" alt="Preview of the selected image for OCR">
           <button class="clear-preview" type="button" aria-label="Remove selected image" onclick="clearImage(event)">&times;</button>
         `;
       };
       reader.readAsDataURL(file);
-
-      document.getElementById("scanBtn").disabled = false;
-      document.getElementById("resultWrapper").classList.add("d-none");
-      document.getElementById("errorBox").classList.add("d-none");
+      document.getElementById('scanBtn').disabled = false;
+      document.getElementById('resultWrapper').classList.add('d-none');
+      document.getElementById('errorBox').classList.add('d-none');
     }
 
     function clearImage(event) {
       event.stopPropagation();
       currentFile = null;
-      const zone = document.getElementById("captureZone");
-      zone.className = "capture-zone";
-      zone.setAttribute("onclick", "handleZoneClick()");
-      zone.setAttribute("onkeydown", "handleZoneKeydown(event)");
+      const zone  = document.getElementById('captureZone');
+      zone.className = 'capture-zone';
+      zone.setAttribute('onclick', 'handleZoneClick()');
+      zone.setAttribute('onkeydown', 'handleZoneKeydown(event)');
       zone.innerHTML = `
         <div id="zonePlaceholder" class="zone-copy">
           <div class="zone-badge" aria-hidden="true">TXT</div>
@@ -1102,92 +1151,102 @@
           <p>Tap here to choose a photo, scan, or screenshot with text. You can also drag an image into this panel.</p>
         </div>
       `;
-      document.getElementById("scanBtn").disabled = true;
+      document.getElementById('scanBtn').disabled = true;
     }
 
+    /* ─────────────────────────────────────────────
+       SCAN
+    ───────────────────────────────────────────── */
     async function submitScan() {
       if (!currentFile) {
         announce('No image selected. Please choose an image first.', false);
         return;
       }
 
-      const mode = document.querySelector('input[name="mode"]:checked').value;
-      const button = document.getElementById("scanBtn");
-      button.disabled = true;
-      button.textContent = "Processing...";
-      button.style.transform = "scale(0.98)";
+      const mode   = document.querySelector('input[name="mode"]:checked').value;
+      const button = document.getElementById('scanBtn');
+      button.disabled       = true;
+      button.textContent    = 'Processing...';
+      button.style.transform = 'scale(0.98)';
 
-      const resultWrapper = document.getElementById("resultWrapper");
-      resultWrapper.classList.remove("d-none");
-      document.getElementById("resultBox").textContent = "";
-      document.getElementById("loadingOverlay").classList.remove("d-none");
-      document.getElementById("loadingOverlay").classList.add("show");
-      document.getElementById("errorBox").classList.add("d-none");
+      const resultWrapper = document.getElementById('resultWrapper');
+      resultWrapper.classList.remove('d-none');
+      document.getElementById('resultBox').textContent = '';
+      document.getElementById('loadingOverlay').classList.remove('d-none');
+      document.getElementById('loadingOverlay').classList.add('show');
+      document.getElementById('errorBox').classList.add('d-none');
 
       const formData = new FormData();
-      formData.append("image", currentFile);
-      formData.append("mode", mode);
+      formData.append('image', currentFile);
+      formData.append('mode',  mode);
+
+      /* Feature 6 — audio feedback: processing state */
+      announce('Processing image…', false);
 
       try {
         console.log('Submitting scan with mode:', mode);
-        const response = await fetch("/scan/", { method: "POST", body: formData });
-        const data = await response.json();
+        const response = await fetch('/scan/', { method: 'POST', body: formData });
+        const data     = await response.json();
 
-        if (!response.ok || data.error) {
-          throw new Error(data.error || `Server error: ${response.status}`);
-        }
+        if (!response.ok || data.error) throw new Error(data.error || `Server error: ${response.status}`);
 
         currentText = data.text;
-        document.getElementById("resultBox").textContent = data.text || "(no text found)";
-        document.getElementById("wordCount").textContent = `${data.word_count} words`;
+        document.getElementById('resultBox').textContent  = data.text || '(no text found)';
+        document.getElementById('wordCount').textContent  = `${data.word_count} words`;
         const confidence = Math.round(data.confidence);
-        document.getElementById("confBar").style.width = `${confidence}%`;
-        document.getElementById("confLabel").textContent = `${confidence}%`;
-        
+        document.getElementById('confBar').style.width   = `${confidence}%`;
+        document.getElementById('confLabel').textContent = `${confidence}%`;
+
+        /* Feature 6 — audio feedback: success */
         console.log('Scan completed successfully');
-        announce(`Extracted ${data.word_count} words with ${confidence}% confidence.`, true);
+        announce(`Extraction complete. ${data.word_count} words found with ${confidence} percent confidence.`, true);
+
       } catch (error) {
         console.error('Scan error:', error);
-        resultWrapper.classList.add("d-none");
-        const errorBox = document.getElementById("errorBox");
-        errorBox.classList.remove("d-none");
+        resultWrapper.classList.add('d-none');
+        const errorBox = document.getElementById('errorBox');
+        errorBox.classList.remove('d-none');
         errorBox.textContent = `Error: ${error.message}`;
         announce(`Scan failed: ${error.message}`, false);
+
       } finally {
-        document.getElementById("loadingOverlay").classList.remove("show");
-        document.getElementById("loadingOverlay").classList.add("d-none");
-        button.disabled = false;
-        button.textContent = "Extract Now";
-        button.style.transform = "";
+        document.getElementById('loadingOverlay').classList.remove('show');
+        document.getElementById('loadingOverlay').classList.add('d-none');
+        button.disabled        = false;
+        button.textContent     = 'Extract Now';
+        button.style.transform = '';
+        /* Return voice engine to LISTENING after scan completes */
+        if (currentState === STATE.PROCESSING) transitionTo(STATE.LISTENING);
       }
     }
 
     function loadScan(text, confidence, words) {
       currentText = text;
-      document.getElementById("resultWrapper").classList.remove("d-none");
-      document.getElementById("resultBox").textContent = text;
-      document.getElementById("wordCount").textContent = `${words} words`;
+      document.getElementById('resultWrapper').classList.remove('d-none');
+      document.getElementById('resultBox').textContent  = text;
+      document.getElementById('wordCount').textContent  = `${words} words`;
       const rounded = Math.round(confidence);
-      document.getElementById("confBar").style.width = `${rounded}%`;
-      document.getElementById("confLabel").textContent = `${rounded}%`;
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      document.getElementById('confBar').style.width   = `${rounded}%`;
+      document.getElementById('confLabel').textContent = `${rounded}%`;
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
+    /* ─────────────────────────────────────────────
+       HISTORY
+    ───────────────────────────────────────────── */
     async function loadHistory() {
       try {
-        const response = await fetch("/history/");
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
+        const response = await fetch('/history/');
+        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
         const data = await response.json();
-        const list = document.getElementById("historyList");
+        const list = document.getElementById('historyList');
 
         if (!data.history || data.history.length === 0) {
           list.innerHTML = '<div class="history-empty">No scans yet. Add an image and your recent reads will appear here.</div>';
           return;
         }
 
-        list.innerHTML = data.history.map(function renderItem(scan) {
+        list.innerHTML = data.history.map(function(scan) {
           return `
             <div class="history-item" onclick='loadScan(${JSON.stringify(scan.text)}, ${scan.confidence}, ${scan.word_count})' role="button" tabindex="0" data-scan-id="${scan.id}">
               <div class="history-item-header">
@@ -1199,34 +1258,24 @@
               <div>${scan.text}</div>
             </div>
           `;
-        }).join("");
+        }).join('');
         console.log('History loaded successfully:', data.history.length, 'items');
       } catch (error) {
         console.error('Failed to load history:', error);
-        const list = document.getElementById("historyList");
-        list.innerHTML = '<div class="history-empty">Error loading history. Please try again.</div>';
+        document.getElementById('historyList').innerHTML = '<div class="history-empty">Error loading history. Please try again.</div>';
       }
     }
 
     async function deleteHistoryItem(event, scanId) {
       event.stopPropagation();
-
-      if (!confirm('Delete this saved scan?')) {
-        return;
-      }
+      if (!confirm('Delete this saved scan?')) return;
 
       try {
         const response = await fetch(`/history/${scanId}/delete/`, {
           method: 'POST',
-          headers: {
-            'X-Requested-With': 'XMLHttpRequest'
-          }
+          headers: { 'X-Requested-With': 'XMLHttpRequest' }
         });
-
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
-
+        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
         const data = await response.json();
         console.log('Deleted scan:', data.deleted_id);
         showToast('Saved scan deleted.');
@@ -1237,171 +1286,154 @@
       }
     }
 
-    // Called from the header "Read Latest" button
+    /* ─────────────────────────────────────────────
+       READ ALOUD
+    ───────────────────────────────────────────── */
     function headerReadLatest() {
       if (!currentText || !currentText.trim()) {
-        // Show a visible toast so the user knows why nothing is spoken
         showToast('No text yet — scan an image first, then press Read Latest.');
-        // Also speak the message
-        const utterance = new SpeechSynthesisUtterance('No text yet. Please scan an image first.');
-        utterance.rate = 0.95;
-        speechSynthesis.cancel();
-        scheduleVoiceRestart(400);
-        speechSynthesis.speak(utterance);
+        announce('No text yet. Please scan an image first.', true);
         return;
       }
       readAloud();
     }
 
     function readAloud() {
-      const speakButton = document.getElementById("speakBtn");
+      const speakButton = document.getElementById('speakBtn');
 
-      if (!currentText || !currentText.trim()) {
-        showToast('No extracted text to read.');
-        return;
-      }
+      if (!currentText || !currentText.trim()) { showToast('No extracted text to read.'); return; }
 
       if (speechSynthesis.speaking) {
-        // Toggle — stop reading
         speechSynthesis.cancel();
-        scheduleVoiceRestart(400);
-        if (speakButton) {
-          speakButton.classList.remove("speaking");
-          speakButton.textContent = "Read Aloud";
-        }
+        scheduleRestart(400);
+        if (speakButton) { speakButton.classList.remove('speaking'); speakButton.textContent = 'Read Aloud'; }
         return;
       }
 
-      // New speech utterance
-      const utterance = new SpeechSynthesisUtterance(currentText);
-      utterance.rate = 0.95;
-      utterance.pitch = 1.0;
-      utterance.volume = 1.0;
-      clearVoiceRestartTimer();
+      const utt = new SpeechSynthesisUtterance(currentText);
+      utt.rate = 0.95; utt.pitch = 1.0; utt.volume = 1.0;
+      clearRestartTimer();
 
-      utterance.onstart = function onStart() {
+      utt.onstart = function() {
         console.log('Speech synthesis started');
-        if (speakButton) {
-          speakButton.classList.add("speaking");
-          speakButton.textContent = "Stop Reading";
-        }
+        transitionTo(STATE.SPEAKING);
+        if (speakButton) { speakButton.classList.add('speaking'); speakButton.textContent = 'Stop Reading'; }
       };
 
-      utterance.onend = function onFinish() {
+      utt.onend = function() {
         console.log('Speech synthesis ended');
-        scheduleVoiceRestart();
-        if (speakButton) {
-          speakButton.classList.remove("speaking");
-          speakButton.textContent = "Read Aloud";
-        }
+        transitionTo(STATE.LISTENING);
+        scheduleRestart();
+        if (speakButton) { speakButton.classList.remove('speaking'); speakButton.textContent = 'Read Aloud'; }
       };
 
-      utterance.onerror = function onError(event) {
+      utt.onerror = function(event) {
         console.error('Speech synthesis error:', event.error);
-        scheduleVoiceRestart();
-        if (speakButton) {
-          speakButton.classList.remove("speaking");
-          speakButton.textContent = "Read Aloud";
-        }
+        scheduleRestart();
+        if (speakButton) { speakButton.classList.remove('speaking'); speakButton.textContent = 'Read Aloud'; }
       };
 
-      try {
-        speechSynthesis.speak(utterance);
-      } catch (error) {
+      try { speechSynthesis.speak(utt); }
+      catch (error) {
         console.error('Error calling speechSynthesis.speak:', error);
-        if (speakButton) {
-          speakButton.classList.remove("speaking");
-          speakButton.textContent = "Read Aloud";
-        }
+        if (speakButton) { speakButton.classList.remove('speaking'); speakButton.textContent = 'Read Aloud'; }
       }
     }
 
     async function copyText(event) {
-      if (!currentText) {
-        return;
-      }
-
+      if (!currentText) return;
       await navigator.clipboard.writeText(currentText);
       const button = event.currentTarget;
-      const originalText = button.textContent;
-      button.textContent = "Copied";
-      setTimeout(function resetLabel() {
-        button.textContent = originalText;
-      }, 1500);
+      const orig   = button.textContent;
+      button.textContent = 'Copied';
+      setTimeout(function() { button.textContent = orig; }, 1500);
     }
 
     function shareText(event) {
-      if (!currentText) {
-        return;
-      }
+      if (!currentText) return;
+      if (navigator.share) { navigator.share({ title: 'Vision Assist', text: currentText }); }
+      else { copyText(event); }
+    }
 
-      if (navigator.share) {
-        navigator.share({ title: "Vision Assist", text: currentText });
-      } else {
-        copyText(event);
-      }
+    /* ═══════════════════════════════════════════════════
+       STATE MACHINE TRANSITION
+    ═══════════════════════════════════════════════════ */
+    function transitionTo(newState) {
+      console.log('[STATE] ' + currentState + ' → ' + newState);
+      currentState = newState;
+      updateVoiceBtn();
     }
 
     /* ─────────────────────────────────────────────
-       VOICE RECOGNITION  –  clean, single implementation
+       TIMER HELPERS
     ───────────────────────────────────────────── */
-
-    /* ── timer helpers ── */
     function clearRestartTimer() {
       if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
     }
 
-    /**
-     * Schedule a restart of the mic after TTS finishes (or immediately if
-     * TTS is not speaking). Backs off safely to avoid hammering the API.
-     */
-    function scheduleRestart(delayMs = 600) {
-      clearRestartTimer();
-      if (!voiceActive && !wakeWordActive) return;  // voice completely off
-      if (isListening) return;                       // already open
+    /* ═══════════════════════════════════════════════════
+       FEATURE 3 — SILENCE DETECTION
+       Arms a timer that aborts the mic if no speech arrives.
+    ═══════════════════════════════════════════════════ */
+    function armSilenceTimer(ms) {
+      clearSilenceTimer();
+      silenceTimer = setTimeout(function() {
+        silenceTimer = null;
+        if (isListening && recognition) {
+          console.log('[VR] silence timeout — aborting mic');
+          try { recognition.abort(); } catch(e) {}
+        }
+      }, ms || 8000);
+    }
 
+    function clearSilenceTimer() {
+      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+    }
+
+    /* ═══════════════════════════════════════════════════
+       FEATURE 7 — CONTROLLED LOOP
+       Restart the mic ONLY from IDLE or LISTENING.
+    ═══════════════════════════════════════════════════ */
+    function scheduleRestart(delayMs) {
+      delayMs = delayMs || 600;
+      clearRestartTimer();
+      if (!voiceEnabled) return;
+      if (currentState === STATE.PROCESSING || currentState === STATE.SPEAKING) return;
+      if (isListening) return;
       restartTimer = setTimeout(function() {
         restartTimer = null;
-        // If TTS is still going, defer again
-        if (speechSynthesis.speaking) {
-          scheduleRestart(400);
-          return;
-        }
+        if (speechSynthesis.speaking) { scheduleRestart(400); return; }
         if (!isListening) startListening({ silent: true });
       }, delayMs);
     }
 
-    function scheduleVoiceRestart(delay = 900) {
-      if (!voiceHandsFreeMode || isListening || speechSynthesis.speaking) {
-        return;
-      }
-
-      clearVoiceRestartTimer();
-      voiceRestartTimer = setTimeout(function restartVoiceAfterDelay() {
-        voiceRestartTimer = null;
-        if (!voiceHandsFreeMode || isListening) {
-          return;
-        }
-        if (speechSynthesis.speaking) {
-          scheduleVoiceRestart(500);
-          return;
-        }
-        startVoiceCommands({ silent: true, isAutoStart: true });
-      }, delay);
+    /* ═══════════════════════════════════════════════════
+       FEATURE 1 — WAKE WORD HELPERS
+    ═══════════════════════════════════════════════════ */
+    function isWakePhrase(lower) {
+      return WAKE_WORDS.some(function(w) { return lower.includes(w); });
     }
 
-    /* ── init speech recognition once ── */
+    function parseCommandAfterWakeWord(lower) {
+      for (var i = 0; i < WAKE_WORDS.length; i++) {
+        var idx = lower.indexOf(WAKE_WORDS[i]);
+        if (idx !== -1) {
+          return lower.slice(idx + WAKE_WORDS[i].length).replace(/^[\s,]+/, '').trim();
+        }
+      }
+      return lower.trim();
+    }
+
+    /* ─────────────────────────────────────────────
+       VOICE RECOGNITION ENGINE
+    ───────────────────────────────────────────── */
     function ensureRecognition() {
       if (recognition) return true;
-
       const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SR) {
-        showToast('Voice recognition not supported in this browser.');
-        return false;
-      }
+      if (!SR) { showToast('Voice recognition not supported in this browser.'); return false; }
 
       recognition = new SR();
-      recognition.continuous      = false;   // one utterance per session
+      recognition.continuous      = false;
       recognition.interimResults  = false;
       recognition.lang            = 'en-US';
       recognition.maxAlternatives = 3;
@@ -1409,120 +1441,128 @@
       recognition.onstart = function() {
         isListening = true;
         clearRestartTimer();
-        console.log('[VR] started');
+        armSilenceTimer(currentState === STATE.LISTENING ? 10000 : 8000);
+        console.log('[VR] started — state:', currentState);
         updateVoiceBtn();
-        if (voiceActive) showToast('Listening…');
+        /* Feature 6 — state-aware feedback */
+        if (currentState === STATE.LISTENING) showToast('Listening for command…');
+        else if (currentState === STATE.IDLE)  showToast('Say "Vision" or "Assist" to activate.');
       };
 
       recognition.onspeechstart = function() {
-        showToast('Speech detected…');
+        clearSilenceTimer();
+        showToast(currentState === STATE.LISTENING ? 'Command detected…' : 'Wake word detected…');
       };
 
-      // ── The heart of recognition ──
+      /* ── onresult — heart of the engine ── */
       recognition.onresult = function(event) {
-        let transcript = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
+        clearSilenceTimer();
+        var transcript = '';
+        var bestConf   = 0;
+
+        for (var i = event.resultIndex; i < event.results.length; i++) {
           if (event.results[i].isFinal) {
-            // Check all alternatives for best match
-            for (let a = 0; a < event.results[i].length; a++) {
-              transcript = event.results[i][a].transcript;
-              break; // use highest confidence alternative
+            var alt  = event.results[i][0];
+            var conf = (typeof alt.confidence === 'number') ? alt.confidence : 1.0;
+            /* Feature 5 — Confidence threshold */
+            if (conf < CONFIDENCE_THRESHOLD) {
+              console.log('[VR] low confidence (' + conf.toFixed(2) + ') — ignoring');
+              showToast('Low confidence (' + Math.round(conf * 100) + '%) — please speak more clearly.');
+              scheduleRestart(600);
+              return;
             }
+            transcript = alt.transcript;
+            bestConf   = conf;
           }
         }
+
         transcript = transcript.trim();
         if (!transcript) return;
 
-        console.log('[VR] heard:', transcript);
+        console.log('[VR] heard: "' + transcript + '" (conf ' + bestConf.toFixed(2) + ')');
         showToast('Heard: "' + transcript + '"');
+        var lower = transcript.toLowerCase().trim();
 
-        const lower = transcript.toLowerCase().trim();
-
-        if (!voiceActive) {
-          // Wake-word mode: only listen for activation phrase
+        /* ════ Feature 7: Controlled Loop ════ */
+        if (currentState === STATE.IDLE) {
           if (isWakePhrase(lower)) {
-            voiceActive    = true;
-            wakeWordActive = false;
-            updateVoiceBtn();
-            // Cancel any ongoing TTS before announcing
+            transitionTo(STATE.LISTENING);
+            var tail = parseCommandAfterWakeWord(lower);
             speechSynthesis.cancel();
-            setTimeout(function() {
-              announce('Voice commands activated. I am listening. Say help for a list of commands.', true);
-            }, 200);
+            /* Feature 6 — wake feedback */
+            setTimeout(function() { announce('Listening. Say a command.', true); }, 150);
+            if (tail) { setTimeout(function() { executeIntent(tail); }, 800); }
+            else       { scheduleRestart(500); }
           } else {
-            showToast('Say "activate voice" to enable voice commands.');
-            scheduleRestart(800);
+            showToast('Say "Vision" or "Assist" to activate voice commands.');
+            scheduleRestart(600);
           }
-        } else {
-          // Hands-free mode: cancel any ongoing TTS and process command
-          if (speechSynthesis.speaking) speechSynthesis.cancel();
-          processVoiceCommand(lower);
+          return;
         }
+
+        if (currentState === STATE.LISTENING) {
+          var now = Date.now();
+          /* Feature 4 — Debounce */
+          if (lower === lastCommand && (now - lastCommandTime) < DEBOUNCE_MS) {
+            console.log('[CMD] debounced — same command within ' + DEBOUNCE_MS + 'ms');
+            showToast('Command already running…');
+            scheduleRestart(800);
+            return;
+          }
+          lastCommand     = lower;
+          lastCommandTime = now;
+          if (speechSynthesis.speaking) speechSynthesis.cancel();
+          transitionTo(STATE.PROCESSING);
+          /* Feature 6 — command accepted */
+          announce('Command received. Processing.', false);
+          setTimeout(function() { executeIntent(lower); }, 300);
+          return;
+        }
+
+        showToast('Busy — please wait a moment…');
       };
 
       recognition.onend = function() {
         isListening = false;
-        console.log('[VR] ended');
+        clearSilenceTimer();
+        console.log('[VR] ended — state:', currentState);
         updateVoiceBtn();
-        // Auto-restart if we are in any active mode
-        if (voiceActive || wakeWordActive) {
+        if (currentState === STATE.IDLE || currentState === STATE.LISTENING) {
           scheduleRestart(600);
         }
       };
 
       recognition.onerror = function(event) {
         isListening = false;
+        clearSilenceTimer();
         console.warn('[VR] error:', event.error);
         updateVoiceBtn();
-
-        if (event.error === 'no-speech') {
-          // Silent – just restart
-          scheduleRestart(500);
-          return;
-        }
-        if (event.error === 'aborted') {
-          scheduleRestart(700);
-          return;
-        }
+        if (event.error === 'no-speech')  { scheduleRestart(500);  return; }
+        if (event.error === 'aborted')    { scheduleRestart(700);  return; }
         if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
           permissionNeeded = true;
+          voiceEnabled     = false;
           showToast('Microphone permission denied. Tap anywhere to retry.');
-          voiceActive    = false;
-          wakeWordActive = false;
-          updateVoiceBtn();
+          transitionTo(STATE.IDLE);
           return;
         }
-        if (event.error === 'network') {
-          showToast('Network error – retrying voice recognition…');
-          scheduleRestart(1500);
-          return;
-        }
-        // Any other error – brief delay then retry
+        if (event.error === 'network') { showToast('Network error — retrying…'); scheduleRestart(1500); return; }
         scheduleRestart(1000);
       };
-
       return true;
     }
 
-    /* ── wake phrase detection ── */
-    function isWakePhrase(lower) {
-      return lower.includes('activate voice') ||
-             lower.includes('start voice') ||
-             lower.includes('turn on voice') ||
-             lower.includes('enable voice') ||
-             lower.includes('hey vision') ||
-             lower.includes('wake up');
-    }
-
-    /* ── public API ── */
+    /* ─────────────────────────────────────────────
+       START LISTENING
+    ───────────────────────────────────────────── */
     function startListening(opts) {
-      const silent = opts && opts.silent;
+      var silent = opts && opts.silent;
       if (!ensureRecognition()) return;
       if (isListening) return;
       clearRestartTimer();
       try {
         recognition.start();
-      } catch (err) {
+      } catch(err) {
         console.warn('[VR] start error:', err.name);
         if (err.name === 'NotAllowedError') {
           permissionNeeded = true;
@@ -1536,51 +1576,313 @@
       }
     }
 
-    /** Called by the 🎤 button and Alt+V */
+    /* ─────────────────────────────────────────────
+       TOGGLE (button / Alt+V)
+    ───────────────────────────────────────────── */
     function toggleVoiceCommands() {
-      if (voiceActive) {
-        // Turn OFF
-        voiceActive    = false;
-        wakeWordActive = false;
+      if (voiceEnabled) {
+        voiceEnabled = false;
         clearRestartTimer();
+        clearSilenceTimer();
         if (isListening && recognition) { try { recognition.stop(); } catch(e){} }
-        updateVoiceBtn();
+        transitionTo(STATE.IDLE);
         showToast('Voice commands paused. Press the mic button or Alt+V to resume.');
+        announce('Voice commands paused.', true);
       } else {
-        // Turn ON directly into hands-free (skip wake word when user taps button)
-        voiceActive    = true;
-        wakeWordActive = false;
+        voiceEnabled     = true;
         permissionNeeded = false;
+        transitionTo(STATE.LISTENING);
         startListening();
-        announce('Voice commands activated. I am listening.', true);
+        announce('Voice commands activated. Say a command, or say help for a list.', true);
       }
     }
 
     function updateVoiceBtn() {
-      const btn = document.getElementById('voiceCommandBtn');
+      var btn = document.getElementById('voiceCommandBtn');
       if (!btn) return;
-      if (isListening && voiceActive) {
-        btn.classList.add('speaking');
-        btn.innerHTML    = '<span aria-hidden="true">🎤</span> Listening';
-        btn.title        = 'Pause voice commands';
-        btn.setAttribute('aria-label', 'Pause voice commands');
-      } else if (voiceActive && !isListening) {
+      if (!voiceEnabled) {
         btn.classList.remove('speaking');
-        btn.innerHTML    = '<span aria-hidden="true">🎤</span> Voice On';
-        btn.title        = 'Voice commands active (Alt+V to toggle)';
-        btn.setAttribute('aria-label', 'Voice commands active');
-      } else if (wakeWordActive) {
-        btn.classList.remove('speaking');
-        btn.innerHTML    = '<span aria-hidden="true">🎤</span> Say "Activate"';
-        btn.title        = 'Say "activate voice" or click to enable hands-free mode (Alt+V)';
-        btn.setAttribute('aria-label', 'Click or say activate voice to enable voice commands');
-      } else {
-        btn.classList.remove('speaking');
-        btn.innerHTML    = '<span aria-hidden="true">🎤</span> Voice Off';
-        btn.title        = 'Click to enable voice commands (Alt+V)';
+        btn.innerHTML = '<span aria-hidden="true">🎤</span> Voice Off';
+        btn.title     = 'Click to enable voice commands (Alt+V)';
         btn.setAttribute('aria-label', 'Click to enable voice commands');
+        return;
+      }
+      /* Feature 2 — state-specific label */
+      switch (currentState) {
+        case STATE.IDLE:
+          btn.classList.remove('speaking');
+          btn.innerHTML = '<span aria-hidden="true">🎤</span> Say "Vision"';
+          btn.title     = 'Waiting for wake word — say "Vision" or "Assist"';
+          btn.setAttribute('aria-label', 'Say Vision or Assist to activate voice commands');
+          break;
+        case STATE.LISTENING:
+          btn.classList.add('speaking');
+          btn.innerHTML = '<span aria-hidden="true">🎤</span> Listening…';
+          btn.title     = 'Listening for your command';
+          btn.setAttribute('aria-label', 'Listening for voice command');
+          break;
+        case STATE.PROCESSING:
+          btn.classList.remove('speaking');
+          btn.innerHTML = '<span aria-hidden="true">⚙️</span> Processing…';
+          btn.title     = 'Executing your command';
+          btn.setAttribute('aria-label', 'Executing voice command');
+          break;
+        case STATE.SPEAKING:
+          btn.classList.remove('speaking');
+          btn.innerHTML = '<span aria-hidden="true">🔊</span> Speaking…';
+          btn.title     = 'Reading aloud';
+          btn.setAttribute('aria-label', 'Reading aloud');
+          break;
       }
     }
+
+    /* ═══════════════════════════════════════════════════
+       FEATURE 8 — INTENT EXECUTION (NLP dispatch)
+    ═══════════════════════════════════════════════════ */
+    function executeIntent(raw) {
+      var intent = matchIntent(raw);
+      console.log('[CMD] raw: "' + raw + '" → intent: ' + intent);
+      switch (intent) {
+
+        case 'deactivate':
+          voiceEnabled = false;
+          clearRestartTimer(); clearSilenceTimer();
+          if (isListening && recognition) { try { recognition.stop(); } catch(e){} }
+          transitionTo(STATE.IDLE);
+          /* Feature 6 */
+          announce('Voice commands deactivated. Say Vision or Assist, or press the mic button whenever you want me again.', true);
+          return;
+
+        case 'help': {
+          var helpMsg =
+            'Available voice commands: ' +
+            'Say Vision or Assist to activate. ' +
+            'Say scan or take photo to capture an image. ' +
+            'Say camera to open the camera. ' +
+            'Say read or read latest to hear extracted text. ' +
+            'Say history or recent scans to view saved scans. ' +
+            'Say extract to run text extraction on the current image. ' +
+            'Say stop reading to halt speech. ' +
+            'Say deactivate to turn off voice commands.';
+          transitionTo(STATE.SPEAKING);
+          announce(helpMsg, true);
+          return;
+        }
+
+        case 'history':
+          announce('Loading recent scans.', true);
+          loadHistory();
+          transitionTo(STATE.LISTENING);
+          var hist = document.getElementById('history');
+          if (hist) hist.scrollIntoView({ behavior: 'smooth' });
+          return;
+
+        case 'read':
+          if (currentText && currentText.trim()) {
+            transitionTo(STATE.SPEAKING);
+            announce('Reading aloud.', false);
+            setTimeout(readAloud, 600);
+          } else {
+            announce('No text to read yet. Please scan an image first.', true);
+            transitionTo(STATE.LISTENING);
+          }
+          return;
+
+        case 'scan':
+          if (currentFile) {
+            announce('Scanning image now.', true);
+            transitionTo(STATE.PROCESSING);
+            submitScan();
+          } else {
+            announce('Opening camera for scanning.', true);
+            transitionTo(STATE.LISTENING);
+            openCamera();
+          }
+          return;
+
+        case 'camera':
+          announce('Opening camera.', true);
+          transitionTo(STATE.LISTENING);
+          openCamera();
+          return;
+
+        case 'extract':
+          if (currentFile) {
+            announce('Extracting text now.', true);
+            transitionTo(STATE.PROCESSING);
+            submitScan();
+          } else {
+            announce('Please add an image first, then say extract.', true);
+            transitionTo(STATE.LISTENING);
+          }
+          return;
+
+        case 'stop_reading':
+          if (speechSynthesis.speaking) {
+            speechSynthesis.cancel();
+            var sb = document.getElementById('speakBtn');
+            if (sb) { sb.classList.remove('speaking'); sb.textContent = 'Read Aloud'; }
+            showToast('Stopped reading.');
+          }
+          transitionTo(STATE.LISTENING);
+          return;
+
+        default:
+          console.log('[CMD] unrecognised:', raw);
+          announce('I did not recognise that command. You said: ' + raw + '. Say help for a list of commands.', true);
+          transitionTo(STATE.LISTENING);
+          return;
+      }
+    }
+
+    /* ─────────────────────────────────────────────
+       TEXT-TO-SPEECH HELPERS
+    ───────────────────────────────────────────── */
+    function announce(message, interrupt) {
+      clearRestartTimer();
+      if (interrupt === undefined) interrupt = true;
+      if (interrupt && speechSynthesis.speaking) {
+        speechSynthesis.cancel();
+      } else if (!interrupt && speechSynthesis.speaking) {
+        console.log('[TTS] busy – skipping:', message);
+        return;
+      }
+      var utt = new SpeechSynthesisUtterance(message);
+      utt.rate = 0.92; utt.pitch = 1.0; utt.volume = 1.0;
+      utt.onend = function() {
+        if (currentState === STATE.SPEAKING) transitionTo(STATE.LISTENING);
+        scheduleRestart(500);
+      };
+      utt.onerror = function(ev) { console.warn('[TTS] error:', ev.error); scheduleRestart(600); };
+      try { speechSynthesis.speak(utt); }
+      catch(e) { console.error('[TTS] speak failed:', e); scheduleRestart(600); }
+    }
+
+    // Toast notification for silent visual feedback
+    function showToast(message) {
+      var toast = document.getElementById('va-toast');
+      if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'va-toast';
+        toast.style.cssText = [
+          'position:fixed', 'bottom:1.5rem', 'left:50%', 'transform:translateX(-50%)',
+          'background:#162231', 'color:#eaf1f7', 'border:1px solid rgba(56,201,153,0.35)',
+          'border-radius:999px', 'padding:0.65rem 1.4rem', 'font-size:0.95rem',
+          'box-shadow:0 12px 28px rgba(0,0,0,0.35)', 'z-index:9999',
+          'transition:opacity 0.3s ease', 'opacity:0', 'pointer-events:none'
+        ].join(';');
+        document.body.appendChild(toast);
+      }
+      toast.textContent   = message;
+      toast.style.opacity = '1';
+      clearTimeout(toast._hideTimer);
+      toast._hideTimer = setTimeout(function() { toast.style.opacity = '0'; }, 3500);
+    }
+
+    // Camera API integration for automatic capture
+    async function captureWithCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
+        mediaStream = stream;
+        const video = document.createElement('video');
+        video.setAttribute('playsinline', '');
+        video.setAttribute('autoplay', '');
+        video.style.display = 'none';
+        video.srcObject = stream;
+        document.body.appendChild(video);
+        const canvas  = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+        video.onloadedmetadata = function() {
+          try {
+            canvas.width  = video.videoWidth;
+            canvas.height = video.videoHeight;
+            context.drawImage(video, 0, 0);
+            if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+            video.parentNode.removeChild(video);
+            canvas.toBlob(blob => {
+              if (blob) {
+                const file = new File([blob], 'camera_capture.jpg', { type: 'image/jpeg' });
+                setFile(file);
+                announce('Image captured. Ready to scan.', false);
+              } else {
+                announce('Failed to capture image. Please try again.', false);
+              }
+            }, 'image/jpeg', 0.94);
+          } catch (error) {
+            console.error('Canvas capture error:', error);
+            announce('Error processing camera image.', false);
+            if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+          }
+        };
+        video.onerror = function() {
+          console.error('Video element error');
+          announce('Failed to load video stream.', false);
+          if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+        };
+      } catch (error) {
+        console.error('Camera capture failed:', error);
+        let errorMsg = 'Camera access failed. ';
+        if (error.name === 'NotAllowedError')     errorMsg += 'Please grant camera permission in your browser settings.';
+        else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') errorMsg += 'No camera device found on this device.';
+        else if (error.name === 'NotReadableError') errorMsg += 'Camera is already in use. Please close other apps using the camera.';
+        else errorMsg += 'Please check your camera and try again.';
+        announce(errorMsg, false);
+      }
+    }
+
+    /* ─────────────────────────────────────────────
+       PAGE INIT
+    ───────────────────────────────────────────── */
+    document.addEventListener('DOMContentLoaded', function() {
+      console.log('[VA] Page initialising…');
+
+      const headerActions = document.querySelector('.app-header .d-flex.gap-2');
+      if (headerActions) {
+        const voiceBtn     = document.createElement('button');
+        voiceBtn.className = 'btn soft-button';
+        voiceBtn.type      = 'button';
+        voiceBtn.id        = 'voiceCommandBtn';
+        voiceBtn.onclick   = toggleVoiceCommands;
+        voiceBtn.innerHTML = '<span aria-hidden="true">🎤</span> Say "Vision"';
+        headerActions.appendChild(voiceBtn);
+        console.log('[VA] Voice button added');
+      }
+
+      ensureRecognition();
+      updateVoiceBtn();
+
+      /* Feature 7 — start in IDLE, silently listen for wake word */
+      transitionTo(STATE.IDLE);
+      startListening({ silent: true });
+
+      document.addEventListener('pointerdown', function() {
+        if (permissionNeeded) { permissionNeeded = false; startListening({ silent: true }); }
+      }, { passive: true });
+      document.addEventListener('keydown', function() {
+        if (permissionNeeded) { permissionNeeded = false; startListening({ silent: true }); }
+      });
+
+      try { loadHistory(); } catch(e) { console.warn('[VA] history load failed:', e); }
+      console.log('[VA] Ready. Say "Vision" or "Assist" to activate voice commands.');
+    });
+
+    /* ─────────────────────────────────────────────
+       KEYBOARD SHORTCUTS
+    ───────────────────────────────────────────── */
+    document.addEventListener('keydown', function(event) {
+      if (event.altKey && event.key === 's') { event.preventDefault(); if (currentFile) submitScan(); else openCamera(); }
+      if (event.altKey && event.key === 'v') { event.preventDefault(); toggleVoiceCommands(); }
+      if (event.altKey && event.key === 'r') { event.preventDefault(); readAloud(); }
+      if (event.altKey && event.key === 'h') {
+        event.preventDefault();
+        loadHistory();
+        const hist = document.getElementById('history');
+        if (hist) hist.scrollIntoView({ behavior: 'smooth' });
+      }
+    });
+  </script>
 
 
 
@@ -1767,154 +2069,6 @@
       toast._hideTimer = setTimeout(function() { toast.style.opacity = '0'; }, 3500);
     }
 
-    // Camera API integration for automatic capture
-    async function captureWithCamera() {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
-        });
-        mediaStream = stream;
-
-        const video = document.createElement('video');
-        video.setAttribute('playsinline', '');
-        video.setAttribute('autoplay', '');
-        video.style.display = 'none';
-        video.srcObject = stream;
-        document.body.appendChild(video);
-
-        // Create canvas for capture
-        const canvas = document.createElement('canvas');
-        const context = canvas.getContext('2d');
-
-        // Wait for video to load metadata
-        video.onloadedmetadata = function() {
-          try {
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            context.drawImage(video, 0, 0);
-
-            // Stop camera and cleanup
-            if (mediaStream) {
-              mediaStream.getTracks().forEach(track => track.stop());
-              mediaStream = null;
-            }
-            video.parentNode.removeChild(video);
-
-            // Convert to blob and process
-            canvas.toBlob(blob => {
-              if (blob) {
-                const file = new File([blob], 'camera_capture.jpg', { type: 'image/jpeg' });
-                setFile(file);
-                announce('Image captured. Ready to scan.', false);
-              } else {
-                announce('Failed to capture image. Please try again.', false);
-              }
-            }, 'image/jpeg', 0.94);
-          } catch (error) {
-            console.error('Canvas capture error:', error);
-            announce('Error processing camera image.', false);
-            if (mediaStream) {
-              mediaStream.getTracks().forEach(track => track.stop());
-              mediaStream = null;
-            }
-          }
-        };
-
-        video.onerror = function() {
-          console.error('Video element error');
-          announce('Failed to load video stream.', false);
-          if (mediaStream) {
-            mediaStream.getTracks().forEach(track => track.stop());
-            mediaStream = null;
-          }
-        };
-      } catch (error) {
-        console.error('Camera capture failed:', error);
-        let errorMsg = 'Camera access failed. ';
-        if (error.name === 'NotAllowedError') {
-          errorMsg += 'Please grant camera permission in your browser settings.';
-        } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
-          errorMsg += 'No camera device found on this device.';
-        } else if (error.name === 'NotReadableError') {
-          errorMsg += 'Camera is already in use. Please close other apps using the camera.';
-        } else {
-          errorMsg += 'Please check your camera and try again.';
-        }
-        announce(errorMsg, false);
-      }
-    }
-
-    /* ─────────────────────────────────────────────
-       PAGE INIT
-    ───────────────────────────────────────────── */
-    document.addEventListener('DOMContentLoaded', function() {
-      console.log('[VA] Page initialising…');
-
-      // Add voice button to header
-      const headerActions = document.querySelector('.app-header .d-flex.gap-2');
-      if (headerActions) {
-        const voiceBtn = document.createElement('button');
-        voiceBtn.className = 'btn soft-button';
-        voiceBtn.type = 'button';
-        voiceBtn.id = 'voiceCommandBtn';
-        voiceBtn.onclick = toggleVoiceCommands;
-        voiceBtn.innerHTML = '<span aria-hidden="true">🎤</span> Voice';
-        headerActions.appendChild(voiceBtn);
-        console.log('[VA] Voice button added');
-      }
-
-      // Prime the recognition engine (no mic yet)
-      ensureRecognition();
-      updateVoiceBtn();
-
-      // Begin wake-word listening quietly
-      // (browser requires a user gesture first on some browsers)
-      wakeWordActive = true;
-      startListening({ silent: true });
-
-      // If permission is blocked, a tap/key will retry
-      document.addEventListener('pointerdown', function tryAfterGesture() {
-        if (permissionNeeded) {
-          permissionNeeded = false;
-          startListening({ silent: true });
-        }
-      }, { passive: true });
-      document.addEventListener('keydown', function tryAfterKey() {
-        if (permissionNeeded) {
-          permissionNeeded = false;
-          startListening({ silent: true });
-        }
-      });
-
-      // Load history
-      try { loadHistory(); } catch(e) { console.warn('[VA] history load failed:', e); }
-
-      console.log('[VA] Ready. Say "activate voice" to enable hands-free mode.');
-    });
-
-    /* ─────────────────────────────────────────────
-       KEYBOARD SHORTCUTS
-    ───────────────────────────────────────────── */
-    document.addEventListener('keydown', function(event) {
-      if (event.altKey && event.key === 's') {
-        event.preventDefault();
-        if (currentFile) { submitScan(); } else { openCamera(); }
-      }
-      if (event.altKey && event.key === 'v') {
-        event.preventDefault();
-        toggleVoiceCommands();
-      }
-      if (event.altKey && event.key === 'r') {
-        event.preventDefault();
-        readAloud();
-      }
-      if (event.altKey && event.key === 'h') {
-        event.preventDefault();
-        loadHistory();
-        const hist = document.getElementById('history');
-        if (hist) hist.scrollIntoView({ behavior: 'smooth' });
-      }
-    });
   </script>
 </body>
 </html>
